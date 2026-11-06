@@ -1,0 +1,605 @@
+==================================================================
+ SPECIFICATION TECHNIQUE ET FONCTIONNELLE
+ Migration WPF -> ASP.NET MVC
+ Page principale - Tableau de donnees editable en ligne (DataTables.js)
+ Version 1.0
+==================================================================
+
+SOMMAIRE
+--------
+1. Contexte et objectif
+2. Perimetre fonctionnel
+   2.1 Affichage du tableau
+   2.2 Colonne "Customer" composite
+   2.3 Edition en ligne (inline edit)
+   2.4 Boutons de validation / annulation
+   2.5 Bouton "Sauvegarder les changements"
+3. Architecture technique proposee
+4. Modele de donnees / ViewModel
+5. Implementation DataTables (front-end)
+   5.1 Structure HTML / Razor
+   5.2 CSS - rendu de la colonne Customer
+   5.3 Initialisation DataTables (mode DOM sourcing)
+   5.4 Passage en mode edition
+   5.5 Gestion des boutons Valider / Annuler
+   5.6 Sauvegarde globale
+6. Implementation ASP.NET MVC (back-end)
+   6.1 Controleur
+   6.2 Endpoints - resume
+7. Regles de gestion et cas limites
+8. Checklist de recette
+
+
+==================================================================
+1. CONTEXTE ET OBJECTIF
+==================================================================
+
+L'application WPF existante expose, sur sa page principale, un tableau
+de donnees permettant a l'utilisateur de consulter des lignes, d'editer
+certaines d'entre elles directement dans le tableau (edition "inline"),
+puis de valider ou d'annuler chaque modification ligne par ligne, avant
+d'enregistrer l'ensemble des changements en base de donnees via un
+bouton global.
+
+Objectif de ce document : decrire precisement le comportement attendu
+afin de reproduire a l'identique cette experience utilisateur dans la
+nouvelle application web ASP.NET MVC, en s'appuyant sur la librairie
+JavaScript DataTables pour l'affichage et l'interaction avec le tableau.
+
+>> OBJECTIF CLE
+Offrir une experience d'edition en ligne equivalente a celle du WPF
+(edition directe dans la cellule, apparition dynamique des boutons de
+validation, sauvegarde differee/groupee), tout en restant dans les
+standards d'une application web MVC (AJAX, JSON, separation
+controleur / vue).
+
+
+==================================================================
+2. PERIMETRE FONCTIONNEL
+==================================================================
+
+--- 2.1 Affichage du tableau ---
+
+- Le tableau affiche la liste des enregistrements (ex. commandes /
+  lignes clients) avec pagination, tri par colonne et recherche
+  globale -> fonctionnalites natives de DataTables.
+- Chaque ligne represente un enregistrement identifie par une cle
+  unique (Id).
+- Certaines colonnes sont editables, d'autres restent en lecture
+  seule (a definir avec le metier / repris de la grille WPF existante).
+- Une colonne "Actions" est reservee, en fin de ligne, a l'apparition
+  conditionnelle des boutons Valider (check vert) et Annuler (croix rouge).
+
+--- 2.2 Colonne "Customer" composite ---
+
+La colonne Customer affiche TROIS informations distinctes dans une
+seule et meme cellule, chacune avec un alignement horizontal
+specifique a l'interieur de la cellule :
+
+  Valeur         | Alignement dans la cellule          | Exemple
+  ---------------|--------------------------------------|---------------
+  ClientId       | GAUCHE (bord gauche de la cellule)   | 10423
+  Code client    | CENTRE (centre dans la cellule)      | CL-PARIS-01
+  Currency       | DROITE (bord droit de la cellule)    | EUR
+
+Visuellement, dans une meme cellule : identifiant a gauche, code
+client au centre, devise a droite - sans colonnes separees.
+
+Wireframe (exemple) :
+
+  | Id | Customer                         | Montant | Date       | Actions |
+  |----|-----------------------------------|---------|------------|---------|
+  | 1  | 10423      CL-PARIS-01      EUR   | 1250,00 | 04/11/2026 |         |
+  | 2  | 10987      CL-LYON-07       USD   | [input] | 05/11/2026 |  V   X  |  <- ligne en cours d'edition
+  | 3  | 10311      CL-NANTES-02     EUR   |  430,00 | 03/11/2026 |         |
+
+(Ligne 2 : fond different pendant l'edition, boutons Valider/Annuler
+visibles uniquement sur cette ligne.)
+
+--- 2.3 Edition en ligne (inline edit) ---
+
+- Au clic (ou double-clic, a valider avec le metier) sur une cellule
+  editable, celle-ci se transforme en champ de saisie (input, select...
+  selon le type de donnee).
+- Plusieurs cellules de la meme ligne peuvent etre editees avant
+  validation (comme dans le WPF, qui autorise la modification de
+  plusieurs champs avant d'enregistrer la ligne).
+- Tant qu'aucune saisie n'a ete effectuee sur la ligne, aucun bouton
+  n'est visible.
+
+--- 2.4 Boutons de validation / annulation ---
+
+>> REGLE DECLENCHANTE
+Les boutons VALIDER (V) et ANNULER (X) apparaissent dans la colonne
+Actions DES QU'UNE SAISIE EST DETECTEE (evenement input/change) sur un
+des champs editables de la ligne - exactement comme dans l'application
+WPF.
+
+  Bouton   | Comportement
+  ---------|---------------------------------------------------------
+  Valider  | Marque la ligne comme "modifiee" (etat local, en memoire
+   (V)     | cote client), fige/affiche les nouvelles valeurs, masque
+           | les boutons. AUCUN appel serveur immediat : l'enregistre-
+           | ment en base ne se fait qu'au clic sur le bouton global
+           | "Sauvegarder les changements" (cf. 2.5), pour reproduire
+           | le fonctionnement WPF ou la validation ligne par ligne
+           | prepare la donnee avant un enregistrement groupe.
+  ---------|---------------------------------------------------------
+  Annuler  | Restaure la/les valeur(s) d'origine de la ligne (avant
+   (X)     | edition), sort du mode edition, masque les boutons,
+           | retire la ligne de la liste des lignes modifiees si elle
+           | y figurait.
+
+>> POINT A VALIDER AVEC LE METIER
+Dans le WPF, le bouton V declenche-t-il un enregistrement immediat en
+base pour la ligne concernee, ou se contente-t-il de "confirmer" la
+saisie localement en attendant le bouton global ? Ce document part de
+la seconde hypothese (coherente avec la presence d'un bouton
+"Sauvegarder les changements" global), a confirmer avant developpement.
+
+--- 2.5 Bouton "Sauvegarder les changements" ---
+
+- Bouton unique, visible en permanence (ou active uniquement si au
+  moins une ligne a ete validee localement - a definir).
+- Au clic, l'ensemble des lignes marquees comme "modifiees" (validees
+  via V) sont envoyees en UN SEUL appel AJAX au controleur MVC, pour
+  un enregistrement groupe en base de donnees.
+- En cas de succes : notification de confirmation, reinitialisation de
+  l'etat "modifie" des lignes.
+- En cas d'echec (partiel ou total) : affichage des erreurs,
+  conservation des lignes en echec dans l'etat "modifie" afin de ne
+  pas perdre la saisie utilisateur.
+
+
+==================================================================
+3. ARCHITECTURE TECHNIQUE PROPOSEE
+==================================================================
+
+  Couche          | Technologie                      | Role
+  ----------------|-----------------------------------|-------------------
+  Vue             | Razor (.cshtml)                   | Rendu COMPLET des
+                   |                                   | lignes du tableau
+                   |                                   | cote serveur, via
+                   |                                   | une boucle
+                   |                                   | @foreach sur
+                   |                                   | @Model.Site (le
+                   |                                   | controleur
+                   |                                   | alimente direct-
+                   |                                   | ement le Model de
+                   |                                   | la vue, pas
+                   |                                   | d'appel AJAX au
+                   |                                   | chargement)
+  ----------------|-----------------------------------|-------------------
+  Front-end       | DataTables.js + jQuery + JS/CSS   | Tri, pagination,
+                   | custom                            | recherche sur le
+                   |                                   | tableau deja
+                   |                                   | present dans le
+                   |                                   | DOM, edition
+                   |                                   | inline, gestion
+                   |                                   | des boutons
+  ----------------|-----------------------------------|-------------------
+  Echanges        | AJAX (JSON)                       | Envoi des
+                   |                                   | modifications
+                   |                                   | uniquement
+                   |                                   | (bouton
+                   |                                   | "Sauvegarder les
+                   |                                   | changements"),
+                   |                                   | pas de chargement
+                   |                                   | initial
+  ----------------|-----------------------------------|-------------------
+  Controleur      | ASP.NET MVC Controller            | Index (charge
+                   |                                   | Model.Site et
+                   |                                   | retourne la vue),
+                   |                                   | SaveChanges
+                   |                                   | (enregistrement
+                   |                                   | groupe)
+  ----------------|-----------------------------------|-------------------
+  Acces donnees   | Entity Framework / Dapper (selon  | Lecture / ecriture
+                   | existant)                         | base de donnees
+
+>> POINT IMPORTANT
+Contrairement a un DataTables "full AJAX" classique, ici LES DONNEES NE
+SONT PAS CHARGEES EN JSON au demarrage : elles sont injectees
+directement dans le HTML par le moteur Razor via
+@foreach (var item in Model.Site), exactement comme la grille WPF
+etait alimentee par son ItemsSource. DataTables est initialise SUR UN
+TABLEAU DEJA REMPLI (mode "DOM sourcing"), et sert uniquement aux
+fonctions de tri / pagination / recherche / edition inline. Seul
+l'enregistrement des modifications (bouton global) transite en AJAX.
+
+
+==================================================================
+4. MODELE DE DONNEES / VIEWMODEL
+==================================================================
+
+Le Model de la vue Index.cshtml expose la collection "Site" consommee
+par le @foreach ; c'est cette meme structure qui sert de base aux
+lignes du tableau et a la logique d'edition inline cote JavaScript
+(via les attributs data-* poses sur chaque <tr>, cf. 5.1).
+
+    // Modele de page (passe a la vue Index)
+    public class CustomersPageViewModel
+    {
+        public List<CustomerRowViewModel> Site { get; set; }
+    }
+
+    // Une ligne du tableau
+    public class CustomerRowViewModel
+    {
+        public int Id { get; set; }
+
+        // Composantes de la colonne "Customer"
+        public int ClientId { get; set; }
+        public string CustomerCode { get; set; }
+        public string Currency { get; set; }
+
+        public decimal Montant { get; set; }
+        public DateTime Date { get; set; }
+
+        // autres colonnes editables reprises de l'existant WPF...
+    }
+
+    // DTO utilise pour l'enregistrement groupe (AJAX de sauvegarde uniquement)
+    public class SaveChangesRequest
+    {
+        public List<CustomerRowViewModel> ModifiedRows { get; set; }
+    }
+
+
+==================================================================
+5. IMPLEMENTATION DATATABLES (FRONT-END)
+==================================================================
+
+--- 5.1 Structure HTML / Razor ---
+
+Le tableau est entierement rendu cote serveur : la vue parcourt
+Model.Site en Razor et genere une ligne <tr> par enregistrement.
+Chaque ligne porte un attribut data-id (cle de l'enregistrement) qui
+sert de repere au JavaScript pour l'edition et la sauvegarde -
+DataTables n'est initialise qu'APRES que ce HTML soit deja present
+dans le DOM.
+
+    <table id="customersTable" class="table table-striped" style="width:100%">
+      <thead>
+        <tr>
+          <th>Id</th>
+          <th>Customer</th>
+          <th>Montant</th>
+          <th>Date</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        @foreach (var item in Model.Site)
+        {
+            <tr data-id="@item.Id">
+                <td>@item.Id</td>
+
+                <td>
+                    <span class="customer-cell">
+                        <span class="client-id">@item.ClientId</span>
+                        <span class="customer-code">@item.CustomerCode</span>
+                        <span class="currency">@item.Currency</span>
+                    </span>
+                </td>
+
+                <td class="editable-cell" data-field="Montant">
+                    <span class="cell-value">@item.Montant</span>
+                    <input type="text" class="cell-input d-none"
+                           value="@item.Montant" data-original="@item.Montant" />
+                </td>
+
+                <td>@item.Date.ToString("dd/MM/yyyy")</td>
+
+                <td class="actions-cell">
+                    <span class="btn-validate d-none" title="Valider">&#10003;</span>
+                    <span class="btn-cancel d-none" title="Annuler">&#10005;</span>
+                </td>
+            </tr>
+        }
+      </tbody>
+    </table>
+
+    <button id="btnSaveAll" class="btn btn-primary" disabled>
+      Sauvegarder les changements
+    </button>
+
+>> ATTENTION
+Chaque cellule editable contient a la fois le texte affiche
+(.cell-value) et un champ de saisie masque (.cell-input, avec sa
+valeur d'origine memorisee dans data-original) directement rendus par
+Razor. Il n'y a donc plus de render() JavaScript cote DataTables pour
+construire ce HTML : il est deja la au chargement de la page.
+
+--- 5.2 CSS - rendu de la colonne Customer ---
+
+La cellule "Customer" utilise un conteneur en position:relative et
+trois elements positionnes en absolute (gauche / centre / droite) afin
+de respecter l'alignement demande a l'interieur d'une seule et meme
+cellule.
+
+    .customer-cell {
+        position: relative;
+        display: block;
+        width: 100%;
+        min-height: 20px;
+    }
+    .customer-cell .client-id {
+        position: absolute;
+        left: 0;
+        text-align: left;
+    }
+    .customer-cell .customer-code {
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        text-align: center;
+    }
+    .customer-cell .currency {
+        position: absolute;
+        right: 0;
+        text-align: right;
+    }
+
+--- 5.3 Initialisation DataTables (mode "DOM sourcing") ---
+
+Le tableau etant deja rempli par Razor, DataTables est initialise SANS
+option ajax ni columns.render : il se contente de "prendre la main"
+sur le HTML existant pour activer le tri, la pagination et la
+recherche. On desactive le tri sur la colonne Actions, et on precise
+un tri personnalise sur la colonne Customer (puisqu'elle contient
+trois valeurs dans une seule cellule).
+
+    const table = $('#customersTable').DataTable({
+        paging: true,
+        searching: true,
+        ordering: true,
+        columnDefs: [
+            {
+                targets: 1, // colonne "Customer"
+                orderDataType: 'dom-text', // trie sur le texte brut de la cellule
+                type: 'string'
+            },
+            {
+                targets: -1, // colonne "Actions"
+                orderable: false,
+                searchable: false
+            }
+        ]
+    });
+
+>> POURQUOI PAS DE SOURCE AJAX ?
+Avec un tableau construit par Razor (comme l'etait la grille WPF via
+son ItemsSource lie au ViewModel), DataTables n'a pas besoin de
+requeter les donnees : elles sont deja dans le DOM au premier rendu de
+la page. Cela simplifie le controleur (pas d'action GetData separee)
+et evite un "flash" de tableau vide le temps du chargement AJAX.
+
+--- 5.4 Passage en mode edition ---
+
+Le tableau etant rendu par Razor (pas de columns.data mappe), toute la
+logique d'edition travaille DIRECTEMENT SUR LE DOM (jQuery classique)
+plutot que sur l'objet interne de DataTables - exactement comme on
+manipulerait les TextBox d'une ligne de DataGrid en WPF.
+
+    $('#customersTable tbody').on('click', 'td.editable-cell', function () {
+        const $cell = $(this);
+        $cell.find('.cell-value').addClass('d-none');
+        $cell.find('.cell-input').removeClass('d-none').trigger('focus');
+    });
+
+--- 5.5 Gestion des boutons Valider / Annuler ---
+
+Les boutons apparaissent DES LA PREMIERE SAISIE (evenement input) dans
+un champ editable de la ligne. La ligne modifiee est identifiee par
+son data-id (pose par Razor, cf. 5.1) et ajoutee a une liste en
+memoire, en attente de la sauvegarde globale.
+
+    const modifiedRows = new Map(); // cle = Id de la ligne (data-id), valeur = donnees modifiees
+
+    // Apparition des boutons des la saisie
+    $('#customersTable tbody').on('input', '.cell-input', function () {
+        const $row = $(this).closest('tr');
+        $row.find('.btn-validate, .btn-cancel').removeClass('d-none');
+        $row.addClass('row-editing');
+    });
+
+    // Clic sur Valider (V)
+    $('#customersTable tbody').on('click', '.btn-validate', function () {
+        const $row = $(this).closest('tr');
+        const id = $row.data('id');
+
+        // lecture des valeurs saisies dans les inputs de la ligne (DOM)
+        const updated = { id: id };
+        $row.find('.editable-cell').each(function () {
+            const field = $(this).data('field');       // ex. "Montant"
+            const value = $(this).find('.cell-input').val();
+            updated[field] = value;
+
+            // affichage : on repasse en lecture seule avec la nouvelle valeur
+            $(this).find('.cell-value').text(value).removeClass('d-none');
+            $(this).find('.cell-input').addClass('d-none').data('original', value);
+        });
+
+        modifiedRows.set(id, updated);
+
+        $row.removeClass('row-editing').addClass('row-pending-save');
+        $row.find('.btn-validate, .btn-cancel').addClass('d-none');
+
+        $('#btnSaveAll').prop('disabled', modifiedRows.size === 0);
+    });
+
+    // Clic sur Annuler (X)
+    $('#customersTable tbody').on('click', '.btn-cancel', function () {
+        const $row = $(this).closest('tr');
+        const id = $row.data('id');
+
+        // restaure la valeur d'origine (attribut data-original pose par Razor au chargement)
+        $row.find('.editable-cell').each(function () {
+            const $input = $(this).find('.cell-input');
+            const original = $input.data('original');
+            $input.val(original);
+            $(this).find('.cell-value').text(original).removeClass('d-none');
+            $input.addClass('d-none');
+        });
+
+        modifiedRows.delete(id);
+        $row.removeClass('row-editing row-pending-save');
+        $row.find('.btn-validate, .btn-cancel').addClass('d-none');
+
+        $('#btnSaveAll').prop('disabled', modifiedRows.size === 0);
+    });
+
+--- 5.6 Sauvegarde globale ---
+
+Au clic sur le bouton global, les lignes validees (map modifiedRows)
+sont envoyees en un seul appel AJAX. Comme le tableau n'est PAS pilote
+par une source de donnees JSON, il n'y a pas de table.ajax.reload()
+possible apres coup : les cellules ont deja ete mises a jour
+visuellement a l'etape "Valider" (5.5) ; on se contente donc de
+nettoyer l'etat "en attente" des lignes sauvegardees.
+
+    $('#btnSaveAll').on('click', function () {
+        const payload = { modifiedRows: Array.from(modifiedRows.values()) };
+
+        $.ajax({
+            url: '/Customers/SaveChanges',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload),
+            success: function (response) {
+                if (response.success) {
+                    // retire le style "en attente" des lignes desormais enregistrees
+                    modifiedRows.forEach((row, id) => {
+                        $(`#customersTable tbody tr[data-id="${id}"]`).removeClass('row-pending-save');
+                    });
+                    modifiedRows.clear();
+                    $('#btnSaveAll').prop('disabled', true);
+                    showNotification('success', 'Modifications enregistrees.');
+                } else {
+                    showNotification('error', response.errors);
+                }
+            },
+            error: function () {
+                showNotification('error', 'Erreur lors de la sauvegarde.');
+            }
+        });
+    });
+
+>> ALTERNATIVE POSSIBLE
+Si l'on prefere reafficher des donnees strictement fraiches depuis la
+base apres sauvegarde (plutot que de faire confiance a l'affichage
+local mis a jour au clic sur V), deux options : recharger la page
+(location.reload()) ou faire renvoyer par SaveChanges une Partial View
+Razor du tableau que l'on reinjecte dans le DOM, suivie d'une
+reinitialisation de DataTables (table.destroy() puis nouvel appel a
+.DataTable()).
+
+
+==================================================================
+6. IMPLEMENTATION ASP.NET MVC (BACK-END)
+==================================================================
+
+--- 6.1 Controleur ---
+
+    public class CustomersController : Controller
+    {
+        private readonly ICustomerService _customerService;
+
+        public CustomersController(ICustomerService customerService)
+        {
+            _customerService = customerService;
+        }
+
+        // Charge les donnees et les pousse directement dans le Model de la vue
+        // (equivalent du ItemsSource de la grille WPF)
+        public ActionResult Index()
+        {
+            var model = new CustomersPageViewModel
+            {
+                Site = _customerService.GetAll() // List<CustomerRowViewModel>
+            };
+
+            return View(model);
+        }
+
+        [HttpPost]
+        public JsonResult SaveChanges(SaveChangesRequest request)
+        {
+            if (request?.ModifiedRows == null || !request.ModifiedRows.Any())
+                return Json(new { success = false, errors = "Aucune ligne a enregistrer." });
+
+            var result = _customerService.UpdateRows(request.ModifiedRows);
+
+            return Json(new
+            {
+                success = result.IsSuccess,
+                errors = result.Errors
+            });
+        }
+    }
+
+--- 6.2 Endpoints - resume ---
+
+  Endpoint                  | Methode    | Entree                | Sortie
+  ---------------------------|------------|-----------------------|---------------------------
+  /Customers/Index           | GET        | -                     | Vue Razor HTML - tableau
+                              |            |                       | deja rempli (Model.Site),
+                              |            |                       | PAS DE JSON
+  ---------------------------|------------|-----------------------|---------------------------
+  /Customers/SaveChanges     | POST (AJAX)| JSON SaveChangesRequest| JSON { success, errors }
+                              |            | (liste des lignes     |
+                              |            | modifiees)             |
+
+Il n'y a donc qu'un seul point d'echange AJAX dans cette page : la
+sauvegarde groupee. Le chargement initial des donnees passe
+exclusivement par le rendu Razor de Index.
+
+
+==================================================================
+7. REGLES DE GESTION ET CAS LIMITES
+==================================================================
+
+- PLUSIEURS LIGNES EN EDITION SIMULTANEE : l'utilisateur doit pouvoir
+  editer plusieurs lignes avant de cliquer sur "Sauvegarder les
+  changements" (comportement WPF a confirmer).
+- NAVIGATION / CHANGEMENT DE PAGE DATATABLES PENDANT UNE EDITION :
+  definir si les modifications non validees (V) sont perdues ou
+  conservees en memoire par Id de ligne.
+- CONCURRENCE : gerer le cas ou une ligne a ete modifiee par un autre
+  utilisateur entre le chargement et la sauvegarde (ex. verification
+  d'un timestamp / version).
+- VALIDATION DES DONNEES : appliquer, cote client (avant apparition du
+  bouton V actif) et cote serveur, les memes regles de validation que
+  l'application WPF (formats, champs obligatoires, plages de valeurs).
+- ANNULATION GLOBALE : prevoir si necessaire un moyen d'annuler toutes
+  les modifications en attente en une seule action.
+
+
+==================================================================
+8. CHECKLIST DE RECETTE
+==================================================================
+
+ # | Scenario                                   | Resultat attendu
+---|---------------------------------------------|---------------------------------------------
+ 1 | Chargement de la page                        | Tableau affiche, aucun bouton V/X visible
+ 2 | Clic dans une cellule editable                | La cellule devient un champ de saisie
+ 3 | Saisie d'un caractere dans un champ editable  | Les boutons V et X apparaissent sur la ligne
+ 4 | Clic sur X                                    | Valeur d'origine restauree, boutons disparaissent
+ 5 | Clic sur V                                    | Ligne marquee "modifiee", boutons disparaissent,
+   |                                               | bouton global active
+ 6 | Colonne Customer                              | ClientId a gauche, Code client centre, Currency
+   |                                               | a droite, dans la meme cellule
+ 7 | Clic sur "Sauvegarder les changements"        | Toutes les lignes validees sont enregistrees en
+   |                                               | base en un seul appel
+ 8 | Erreur serveur lors de la sauvegarde          | Message d'erreur affiche, lignes concernees
+   |                                               | conservees en etat "modifie"
+ 9 | Tri / pagination / recherche DataTables       | Fonctionnels, sans regression sur l'etat
+   |                                               | d'edition en cours
+
+
+------------------------------------------------------------------
+Document de specification a valider avec le metier avant
+developpement : section 2.4 (comportement exact du bouton V) et
+section 7 (cas limites) a confirmer.
+------------------------------------------------------------------
